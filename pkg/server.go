@@ -17,7 +17,7 @@ import (
 )
 
 type Server struct {
-	endpoints map[string]http.Handler
+	endpoints []*Endpoint
 	logger    *logrus.Logger
 }
 
@@ -32,25 +32,24 @@ func (s Server) Start(listenAddr string) error {
 	r := mux.NewRouter()
 	r.Use(LoggingMiddleware)
 	for _, e := range s.endpoints {
-		switch (e).(type) {
+		switch (e.Destination).(type) {
 		case NotFoundFileHandler:
-			r.NotFoundHandler = LoggingMiddleware(e)
+			r.NotFoundHandler = LoggingMiddleware(e.Destination)
 		default:
 		}
 	}
 
-	for k, e := range s.endpoints {
-		switch (e).(type) {
+	for _, e := range s.endpoints {
+		switch (e.Destination).(type) {
 		case filesystemHandler:
-			fsHandler := e.(filesystemHandler)
+			fsHandler := e.Destination.(filesystemHandler)
 			fsHandler.notFoundHandler = r.NotFoundHandler
-			s.endpoints[k] = fsHandler
-			fmt.Printf("%s = %v\n", k, fsHandler)
-			r.NewRoute().PathPrefix(k).Handler(fsHandler)
+			fmt.Printf("%s = %v\n", e.MountPoint, fsHandler)
+			r.NewRoute().PathPrefix(e.MountPoint).Handler(fsHandler)
 		case NotFoundFileHandler:
 		default:
-			fmt.Printf("%s = %v\n", k, e)
-			r.NewRoute().PathPrefix(k).Handler(e)
+			fmt.Printf("%s = %v\n", e.MountPoint, e.Destination)
+			r.NewRoute().PathPrefix(e.MountPoint).Handler(e.Destination)
 		}
 	}
 
@@ -67,21 +66,21 @@ func reverseProxy(dest string) (*httputil.ReverseProxy, error) {
 		req.URL.Scheme = destUrl.Scheme
 		req.URL.Host = destUrl.Host
 		req.URL.Path = destUrl.Path + req.URL.Path
-		req.Host = destUrl.Host
 	}
 	proxy := &httputil.ReverseProxy{Director: director}
 	return proxy, nil
 }
 
 func New(endpoints []string) (*Server, error) {
-	server := Server{endpoints: map[string]http.Handler{}}
+	server := Server{endpoints: nil}
 	server.logger = logrus.New()
+	server.logger.SetLevel(logrus.DebugLevel)
 	for _, e := range endpoints {
 		parsedEndpoint, err := server.parseEndpoint(e)
 		if err != nil {
 			return nil, fmt.Errorf("unable to parse endpoint: %v", err)
 		}
-		server.endpoints[parsedEndpoint.MountPoint] = parsedEndpoint.Destination
+		server.endpoints = append(server.endpoints, parsedEndpoint)
 	}
 	return &server, nil
 }
@@ -155,8 +154,13 @@ type filesystemHandler struct {
 }
 
 func (s *Server) newFSHandler(path string) filesystemHandler {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		panic(err)
+	}
+	s.logger.Debugf("serving from %s", absPath)
 	return filesystemHandler{
-		path: path,
+		path: absPath,
 		logger: s.logger,
 	}
 }
@@ -173,19 +177,24 @@ func (f filesystemHandler) ServeHTTP(writer http.ResponseWriter, request *http.R
 
 	fullPath := filepath.Join(f.path, "/", uri)
 	cleanPath := path.Clean(fullPath)
-	fromSlash := filepath.FromSlash(cleanPath)
-
-	if !strings.HasPrefix(fromSlash, filepath.FromSlash(f.path)) {
-		f.logger.Printf("path traversal: %v", fromSlash)
+	absFilePath, err := filepath.Abs(cleanPath)
+	if err != nil {
+		f.logger.Printf("cannot get abs path for %s: %v", cleanPath, err)
 		http.Error(writer, "404 - Not found", http.StatusNotFound)
 		return
 	}
 
-	stat, err := os.Stat(fromSlash)
+	if !strings.HasPrefix(absFilePath, f.path) {
+		f.logger.Printf("path traversal: %v", absFilePath)
+		http.Error(writer, "404 - Not found", http.StatusNotFound)
+		return
+	}
+
+	stat, err := os.Stat(absFilePath)
 	if err != nil {
 		f.logger.Printf("unable to open file %s: %s", uri, err.Error())
 		if f.notFoundHandler == nil {
-			http.Error(writer, "404 - Not found", http.StatusNotFound)
+			http.Error(writer, "404 - Not found (not found handler missing)", http.StatusNotFound)
 			return
 		}
 		f.notFoundHandler.ServeHTTP(writer, request)
@@ -193,10 +202,10 @@ func (f filesystemHandler) ServeHTTP(writer http.ResponseWriter, request *http.R
 	}
 
 	if stat.IsDir() {
-		fromSlash += "/index.html"
+		absFilePath += "/index.html"
 	}
 
-	file, err := os.Open(fromSlash)
+	file, err := os.Open(absFilePath)
 	if err != nil {
 		f.logger.Printf("unable to open file %s: %s", uri, err.Error())
 		if f.notFoundHandler == nil {
@@ -211,7 +220,7 @@ func (f filesystemHandler) ServeHTTP(writer http.ResponseWriter, request *http.R
 		http.Error(writer, "Internal server error", http.StatusInternalServerError)
 		return
 	}
-	contentType := mime.TypeByExtension("." + filepath.Ext(fromSlash))
+	contentType := mime.TypeByExtension("." + filepath.Ext(absFilePath))
 	writer.Header().Set("Content-Type", contentType)
 	_, _ = writer.Write(fileBytes)
 }
